@@ -1,4 +1,4 @@
-# CyberShield Interactive Quiz Platform
+# LandofCyber Interactive Quiz Platform
 
 This repo is the starting scaffold for a Next.js (App Router) + Supabase build.
 

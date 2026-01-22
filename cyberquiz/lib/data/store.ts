@@ -244,7 +244,7 @@ export async function getCategoryById(categoryId: string) {
   return store.categories.find((category) => category.id === categoryId);
 }
 
-export async function getQuizzes() {
+export async function getQuizzes(): Promise<Quiz[]> {
   const store = await readStore();
   return store.quizzes;
 }
@@ -613,7 +613,7 @@ export async function createQuizAsAdmin(input: {
     options: Array<{ label: string; isCorrect: boolean }>;
   }>;
   adminId: string;
-}) {
+}): Promise<Quiz> {
   const title = requireText(input.title, "Title", MAX_TITLE_LEN);
   const description = optionalText(input.description, MAX_DESC_LEN) ?? "";
   const categoryId = requireText(input.categoryId, "Category", MAX_CATEGORY_NAME_LEN);

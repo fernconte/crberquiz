@@ -239,6 +239,7 @@
       "role": "admin",
       "salt": "06a3922995b48f11def51a40e628cc1f",
       "passwordHash": "b9076f2299f27d11ff18e6d201e61b70a379de8d0ea660ed8f97bb1763758491",
+      "passwordAlgo": "sha256",
       "createdAt": "2026-01-20T12:00:00Z"
     }
   ],

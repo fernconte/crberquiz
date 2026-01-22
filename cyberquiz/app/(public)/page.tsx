@@ -6,6 +6,9 @@ export const dynamic = "force-dynamic";
 
 export default async function Home() {
   const categories = await getCategories();
+  const featuredCategories = categories.filter(
+    (category) => !["iot", "social"].includes(category.id),
+  );
 
   return (
     <main className="min-h-screen px-6 py-12 md:px-12">
@@ -43,7 +46,7 @@ export default async function Home() {
         </GlassPanel>
 
         <section className="grid gap-6 md:grid-cols-2">
-          {categories.map((category) => (
+          {featuredCategories.map((category) => (
             <GlassPanel key={category.id} className="p-6">
               <h2 className="text-xl font-semibold text-white">
                 {category.name}

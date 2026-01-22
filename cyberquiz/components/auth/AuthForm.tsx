@@ -71,6 +71,8 @@ export function AuthForm({ mode }: AuthFormProps) {
               required
               value={username}
               onChange={(event) => setUsername(event.target.value)}
+              pattern="[A-Za-z0-9_.-]+"
+              title="Use letters, numbers, dot, dash, or underscore."
               className="mt-2 w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white outline-none transition focus:border-cyber-cyan/60"
             />
           </label>
@@ -93,6 +95,7 @@ export function AuthForm({ mode }: AuthFormProps) {
         <input
           type="password"
           required
+          minLength={8}
           value={password}
           onChange={(event) => setPassword(event.target.value)}
           className="mt-2 w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white outline-none transition focus:border-cyber-cyan/60"

@@ -10,7 +10,7 @@ const spaceMono = Space_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "CyberShield Quiz Platform",
+  title: "LandofCyber Quiz Platform",
   description: "Interactive cyber security quizzes with community content.",
 };
 

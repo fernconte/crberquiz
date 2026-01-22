@@ -16,6 +16,9 @@ export default async function NewQuizPage() {
             Share your questions with the community. Admins will review before
             publishing.
           </p>
+          <p className="mt-2 text-sm text-white/60">
+            Select one correct answer for each question.
+          </p>
         </div>
 
         <GlassPanel className="p-8">

@@ -37,7 +37,7 @@ export default async function QuizzesPage() {
                   {quiz.title}
                 </h2>
                 <p className="mt-2 text-sm text-white/70">
-                  {categoryMap.get(quiz.categoryId) ?? "General"} ·{" "}
+                  {categoryMap.get(quiz.categoryId) ?? "General"} -{" "}
                   {quiz.questions.length} questions
                 </p>
                 <p className="mt-3 text-sm text-white/60">{quiz.description}</p>
@@ -55,3 +55,5 @@ export default async function QuizzesPage() {
     </main>
   );
 }
+
+

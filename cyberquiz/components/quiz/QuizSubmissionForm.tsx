@@ -1,6 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
+import {
+  QuestionEditor,
+  createDraftQuestion,
+  type DraftQuestion,
+} from "@/components/quiz/QuestionEditor";
 
 type Category = {
   id: string;
@@ -19,25 +24,13 @@ type QuizSubmissionFormProps = {
   categories: Category[];
 };
 
-const sampleQuestions = [
-  {
-    prompt: "What does CSRF stand for?",
-    options: [
-      { label: "Cross-Site Request Forgery", isCorrect: true },
-      { label: "Cross-Site Resource Format", isCorrect: false },
-      { label: "Client-Side Request Filter", isCorrect: false },
-      { label: "Cross-Server Routing Function", isCorrect: false },
-    ],
-  },
-];
-
 export function QuizSubmissionForm({ categories }: QuizSubmissionFormProps) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [categoryId, setCategoryId] = useState(categories[0]?.id ?? "");
-  const [questionsJson, setQuestionsJson] = useState(
-    JSON.stringify(sampleQuestions, null, 2),
-  );
+  const [questions, setQuestions] = useState<DraftQuestion[]>([
+    createDraftQuestion(),
+  ]);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -49,6 +42,12 @@ export function QuizSubmissionForm({ categories }: QuizSubmissionFormProps) {
     () => categories.map((category) => ({ id: category.id, label: category.name })),
     [categories],
   );
+
+  useEffect(() => {
+    if (!categoryId && categories.length > 0) {
+      setCategoryId(categories[0]?.id ?? "");
+    }
+  }, [categoryId, categories]);
 
   async function loadSubmissions() {
     setIsLoadingSubmissions(true);
@@ -83,17 +82,29 @@ export function QuizSubmissionForm({ categories }: QuizSubmissionFormProps) {
     setIsSubmitting(true);
 
     try {
-      const parsed = JSON.parse(questionsJson);
-      if (!Array.isArray(parsed) || parsed.length === 0) {
-        throw new Error("Questions JSON must be an array.");
-      }
+      const payloadQuestions = questions.map((question) => ({
+        prompt: question.prompt,
+        options: question.options.map((option) => ({
+          label: option.label,
+          isCorrect: option.isCorrect,
+        })),
+      }));
 
-      for (const question of parsed) {
-        if (!question.prompt || !Array.isArray(question.options)) {
-          throw new Error("Each question needs a prompt and options array.");
+      if (payloadQuestions.length === 0) {
+        throw new Error("Questions are required.");
+      }
+      for (const question of payloadQuestions) {
+        if (!question.prompt.trim()) {
+          throw new Error("Each question needs a prompt.");
         }
-        if (question.options.length < 2) {
+        if (!question.options || question.options.length < 2) {
           throw new Error("Each question needs at least two options.");
+        }
+        if (question.options.some((option) => !option.label.trim())) {
+          throw new Error("Each option needs a label.");
+        }
+        if (!question.options.some((option) => option.isCorrect)) {
+          throw new Error("Each question needs a correct option.");
         }
       }
 
@@ -104,7 +115,7 @@ export function QuizSubmissionForm({ categories }: QuizSubmissionFormProps) {
           title,
           description,
           categoryId,
-          questions: parsed,
+          questions: payloadQuestions,
         }),
       });
 
@@ -116,7 +127,7 @@ export function QuizSubmissionForm({ categories }: QuizSubmissionFormProps) {
       setStatus("Quiz submitted for review.");
       setTitle("");
       setDescription("");
-      setQuestionsJson(JSON.stringify(sampleQuestions, null, 2));
+      setQuestions([createDraftQuestion()]);
       await loadSubmissions();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Submission failed.");
@@ -163,14 +174,10 @@ export function QuizSubmissionForm({ categories }: QuizSubmissionFormProps) {
           </select>
         </label>
 
-        <label className="block text-sm text-white/70">
-          Questions JSON
-          <textarea
-            value={questionsJson}
-            onChange={(event) => setQuestionsJson(event.target.value)}
-            className="mt-2 min-h-[240px] w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 font-mono text-xs text-white outline-none transition focus:border-cyber-cyan/60"
-          />
-        </label>
+        <div className="space-y-3">
+          <p className="text-sm text-white/70">Questions</p>
+          <QuestionEditor value={questions} onChange={setQuestions} />
+        </div>
 
         {error ? (
           <p className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">

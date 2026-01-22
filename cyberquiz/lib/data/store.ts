@@ -2,6 +2,21 @@ import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
 
+const MAX_TITLE_LEN = 120;
+const MAX_DESC_LEN = 500;
+const MAX_QUESTION_COUNT = 20;
+const MAX_OPTION_COUNT = 6;
+const MAX_PROMPT_LEN = 240;
+const MAX_OPTION_LEN = 140;
+const MAX_USERNAME_LEN = 24;
+const MAX_EMAIL_LEN = 120;
+const MIN_PASSWORD_LEN = 8;
+const MAX_PASSWORD_LEN = 128;
+const MAX_CATEGORY_NAME_LEN = 40;
+const MAX_CATEGORY_DESC_LEN = 160;
+const MAX_REJECTION_LEN = 200;
+const PASSWORD_KEYLEN = 64;
+
 export type Category = {
   id: string;
   name: string;
@@ -48,6 +63,7 @@ export type User = {
   role: "user" | "admin";
   salt: string;
   passwordHash: string;
+  passwordAlgo?: "sha256" | "scrypt";
   createdAt: string;
 };
 
@@ -75,13 +91,32 @@ export type Store = {
 const storePath = path.join(process.cwd(), "data", "store.json");
 
 async function readStore(): Promise<Store> {
-  const raw = await fs.readFile(storePath, "utf8");
-  return JSON.parse(raw) as Store;
+  try {
+    const raw = await fs.readFile(storePath, "utf8");
+    return JSON.parse(raw) as Store;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      throw new Error("Storage file missing.");
+    }
+    if (err.code === "EACCES" || err.code === "EPERM") {
+      throw new Error("Storage is not readable.");
+    }
+    throw error;
+  }
 }
 
 async function writeStore(store: Store) {
   const json = JSON.stringify(store, null, 2);
-  await fs.writeFile(storePath, `${json}\n`);
+  try {
+    await fs.writeFile(storePath, `${json}\n`);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "EACCES" || err.code === "EPERM" || err.code === "EROFS") {
+      throw new Error("Storage is read-only.");
+    }
+    throw error;
+  }
 }
 
 async function updateStore(
@@ -93,10 +128,110 @@ async function updateStore(
   return store;
 }
 
-function hashPassword(password: string, salt: string) {
-  const hash = crypto.createHash("sha256");
-  hash.update(`${salt}:${password}`);
-  return hash.digest("hex");
+function requireText(value: string, field: string, maxLen: number) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`${field} is required.`);
+  }
+  if (trimmed.length > maxLen) {
+    throw new Error(`${field} is too long.`);
+  }
+  return trimmed;
+}
+
+function optionalText(value: string | undefined, maxLen: number) {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (trimmed.length > maxLen) {
+    throw new Error("Value is too long.");
+  }
+  return trimmed;
+}
+
+function validateEmail(email: string) {
+  if (email.length > MAX_EMAIL_LEN) {
+    throw new Error("Email is too long.");
+  }
+  const basicPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!basicPattern.test(email)) {
+    throw new Error("Email is invalid.");
+  }
+}
+
+function validateUsername(username: string) {
+  if (username.length > MAX_USERNAME_LEN) {
+    throw new Error("Username is too long.");
+  }
+  const pattern = /^[a-zA-Z0-9_.-]+$/;
+  if (!pattern.test(username)) {
+    throw new Error("Username can only use letters, numbers, ., - and _.");
+  }
+}
+
+function slugify(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-+|-+$)/g, "");
+}
+
+function hashPassword(
+  password: string,
+  salt: string,
+  algo: "sha256" | "scrypt",
+) {
+  if (algo === "sha256") {
+    const hash = crypto.createHash("sha256");
+    hash.update(`${salt}:${password}`);
+    return hash.digest("hex");
+  }
+  const derived = crypto.scryptSync(password, salt, PASSWORD_KEYLEN);
+  return derived.toString("hex");
+}
+
+function normalizeQuestions(
+  input: Array<{
+    prompt: string;
+    options: Array<{ label: string; isCorrect: boolean }>;
+  }>,
+) {
+  if (!Array.isArray(input) || input.length === 0) {
+    throw new Error("Questions are required.");
+  }
+  if (input.length > MAX_QUESTION_COUNT) {
+    throw new Error("Too many questions.");
+  }
+
+  return input.map((question) => {
+    const prompt = requireText(question.prompt ?? "", "Question prompt", MAX_PROMPT_LEN);
+    if (!Array.isArray(question.options) || question.options.length < 2) {
+      throw new Error("Each question needs at least two options.");
+    }
+    if (question.options.length > MAX_OPTION_COUNT) {
+      throw new Error("Too many options in a question.");
+    }
+
+    const options = question.options.map((option) => ({
+      id: `opt-${crypto.randomUUID()}`,
+      label: requireText(option.label ?? "", "Option label", MAX_OPTION_LEN),
+      isCorrect: Boolean(option.isCorrect),
+    }));
+    const correctCount = options.filter((option) => option.isCorrect).length;
+    if (correctCount !== 1) {
+      throw new Error("Each question needs exactly one correct option.");
+    }
+
+    return {
+      id: `q-${crypto.randomUUID()}`,
+      prompt,
+      options,
+    };
+  });
 }
 
 export async function getCategories() {
@@ -124,39 +259,56 @@ export async function getLeaderboard() {
   return store.leaderboard;
 }
 
-export async function createUser(input: {
+export async function getUsers() {
+  const store = await readStore();
+  return store.users;
+}
+
+type CreateUserInput = {
   email: string;
   username: string;
   password: string;
   displayName?: string;
-}) {
-  const email = input.email.trim().toLowerCase();
-  const username = input.username.trim();
-  const password = input.password.trim();
+};
 
-  if (!email || !username || !password) {
-    throw new Error("Missing fields.");
+type CreateUserInternalInput = CreateUserInput & {
+  role: "user" | "admin";
+};
+
+async function createUserInternal(input: CreateUserInternalInput) {
+  const email = requireText(input.email, "Email", MAX_EMAIL_LEN).toLowerCase();
+  validateEmail(email);
+  const username = requireText(input.username, "Username", MAX_USERNAME_LEN);
+  validateUsername(username);
+  const password = requireText(input.password, "Password", MAX_PASSWORD_LEN);
+  if (password.length < MIN_PASSWORD_LEN) {
+    throw new Error("Password must be at least 8 characters.");
   }
+  const displayName =
+    optionalText(input.displayName, MAX_USERNAME_LEN) ?? username;
 
   let createdUser: User | null = null;
 
   await updateStore((store) => {
     const emailExists = store.users.some((user) => user.email === email);
-    const usernameExists = store.users.some((user) => user.username === username);
+    const usernameExists = store.users.some(
+      (user) => user.username.toLowerCase() === username.toLowerCase(),
+    );
     if (emailExists || usernameExists) {
       throw new Error("User already exists.");
     }
 
     const salt = crypto.randomBytes(16).toString("hex");
-    const passwordHash = hashPassword(password, salt);
+    const passwordHash = hashPassword(password, salt, "scrypt");
     const user: User = {
       id: `user-${crypto.randomUUID()}`,
       email,
       username,
-      displayName: input.displayName?.trim() || username,
-      role: "user",
+      displayName,
+      role: input.role,
       salt,
       passwordHash,
+      passwordAlgo: "scrypt",
       createdAt: new Date().toISOString(),
     };
     createdUser = user;
@@ -173,6 +325,16 @@ export async function createUser(input: {
   }
 
   return createdUser;
+}
+
+export async function createUser(input: CreateUserInput) {
+  return createUserInternal({ ...input, role: "user" });
+}
+
+export async function createUserAsAdmin(
+  input: CreateUserInput & { role?: "user" | "admin" },
+) {
+  return createUserInternal({ ...input, role: input.role ?? "user" });
 }
 
 export async function verifyUser(input: {
@@ -193,8 +355,14 @@ export async function verifyUser(input: {
     throw new Error("Invalid credentials.");
   }
 
-  const passwordHash = hashPassword(password, user.salt);
-  if (passwordHash !== user.passwordHash) {
+  const algo = user.passwordAlgo ?? "sha256";
+  const passwordHash = hashPassword(password, user.salt, algo);
+  const expected = Buffer.from(user.passwordHash, "hex");
+  const actual = Buffer.from(passwordHash, "hex");
+  if (expected.length !== actual.length) {
+    throw new Error("Invalid credentials.");
+  }
+  if (!crypto.timingSafeEqual(expected, actual)) {
     throw new Error("Invalid credentials.");
   }
 
@@ -251,34 +419,19 @@ export async function submitQuiz(input: {
   }>;
   userId: string;
 }) {
-  const title = input.title.trim();
-  const description = input.description.trim();
-  const categoryId = input.categoryId.trim();
-  const questions = input.questions;
-
-  if (!title || !categoryId || questions.length === 0) {
-    throw new Error("Missing quiz details.");
-  }
-
-  for (const question of questions) {
-    if (!question.prompt.trim()) {
-      throw new Error("Each question needs a prompt.");
-    }
-    if (!question.options || question.options.length < 2) {
-      throw new Error("Each question needs at least two options.");
-    }
-    for (const option of question.options) {
-      if (!option.label.trim()) {
-        throw new Error("Each option needs a label.");
-      }
-    }
-    const hasCorrect = question.options.some((option) => option.isCorrect);
-    if (!hasCorrect) {
-      throw new Error("Each question needs a correct option.");
-    }
-  }
+  const title = requireText(input.title, "Title", MAX_TITLE_LEN);
+  const description = optionalText(input.description, MAX_DESC_LEN) ?? "";
+  const categoryId = requireText(input.categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+  const questions = normalizeQuestions(input.questions);
 
   await updateStore((store) => {
+    const categoryExists = store.categories.some(
+      (category) => category.id === categoryId,
+    );
+    if (!categoryExists) {
+      throw new Error("Category not found.");
+    }
+
     const pendingQuiz: PendingQuiz = {
       id: `pending-${crypto.randomUUID()}`,
       title,
@@ -289,15 +442,7 @@ export async function submitQuiz(input: {
       submittedBy: input.userId,
       submittedAt: new Date().toISOString(),
       status: "pending",
-      questions: questions.map((question) => ({
-        id: `q-${crypto.randomUUID()}`,
-        prompt: question.prompt.trim(),
-        options: question.options.map((option) => ({
-          id: `opt-${crypto.randomUUID()}`,
-          label: option.label.trim(),
-          isCorrect: Boolean(option.isCorrect),
-        })),
-      })),
+      questions,
     };
 
     store.pendingQuizzes.push(pendingQuiz);
@@ -321,14 +466,15 @@ export async function updatePendingQuiz(input: {
   title: string;
   description: string;
   categoryId: string;
-  questions: Question[];
+  questions: Array<{
+    prompt: string;
+    options: Array<{ label: string; isCorrect: boolean }>;
+  }>;
 }) {
-  if (!input.title.trim() || !input.categoryId.trim()) {
-    throw new Error("Title and category are required.");
-  }
-  if (input.questions.length === 0) {
-    throw new Error("Questions are required.");
-  }
+  const title = requireText(input.title, "Title", MAX_TITLE_LEN);
+  const description = optionalText(input.description, MAX_DESC_LEN) ?? "";
+  const categoryId = requireText(input.categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+  const questions = normalizeQuestions(input.questions);
 
   return updateStore((store) => {
     const quiz = store.pendingQuizzes.find((item) => item.id === input.quizId);
@@ -336,10 +482,17 @@ export async function updatePendingQuiz(input: {
       throw new Error("Pending quiz not found.");
     }
 
-    quiz.title = input.title.trim();
-    quiz.description = input.description.trim();
-    quiz.categoryId = input.categoryId.trim();
-    quiz.questions = input.questions;
+    const categoryExists = store.categories.some(
+      (category) => category.id === categoryId,
+    );
+    if (!categoryExists) {
+      throw new Error("Category not found.");
+    }
+
+    quiz.title = title;
+    quiz.description = description;
+    quiz.categoryId = categoryId;
+    quiz.questions = questions;
   });
 }
 
@@ -380,8 +533,166 @@ export async function rejectPendingQuiz(input: {
     }
 
     quiz.status = "rejected";
-    quiz.rejectionReason = input.rejectionReason.trim();
+    quiz.rejectionReason = requireText(
+      input.rejectionReason ?? "",
+      "Rejection reason",
+      MAX_REJECTION_LEN,
+    );
     quiz.reviewedBy = input.adminId;
     quiz.reviewedAt = new Date().toISOString();
+  });
+}
+
+export async function createCategory(input: {
+  name: string;
+  description?: string;
+}) {
+  const name = requireText(input.name, "Category name", MAX_CATEGORY_NAME_LEN);
+  const description =
+    optionalText(input.description, MAX_CATEGORY_DESC_LEN) ?? "";
+  const slug = slugify(name);
+  if (!slug) {
+    throw new Error("Category name is invalid.");
+  }
+
+  let created: Category | null = null;
+
+  await updateStore((store) => {
+    const exists = store.categories.some(
+      (category) => category.id === slug || category.slug === slug,
+    );
+    if (exists) {
+      throw new Error("Category already exists.");
+    }
+
+    const category: Category = {
+      id: slug,
+      name,
+      slug,
+      description,
+    };
+    created = category;
+    store.categories.push(category);
+  });
+
+  if (!created) {
+    throw new Error("Category creation failed.");
+  }
+
+  return created;
+}
+
+export async function deleteCategory(categoryId: string) {
+  const id = requireText(categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+
+  return updateStore((store) => {
+    const category = store.categories.find((item) => item.id === id);
+    if (!category) {
+      throw new Error("Category not found.");
+    }
+    const usedInQuizzes = store.quizzes.some(
+      (quiz) => quiz.categoryId === id,
+    );
+    const usedInPending = store.pendingQuizzes.some(
+      (quiz) => quiz.categoryId === id,
+    );
+    if (usedInQuizzes || usedInPending) {
+      throw new Error("Category is in use.");
+    }
+
+    store.categories = store.categories.filter((item) => item.id !== id);
+  });
+}
+
+export async function createQuizAsAdmin(input: {
+  title: string;
+  description: string;
+  categoryId: string;
+  questions: Array<{
+    prompt: string;
+    options: Array<{ label: string; isCorrect: boolean }>;
+  }>;
+  adminId: string;
+}) {
+  const title = requireText(input.title, "Title", MAX_TITLE_LEN);
+  const description = optionalText(input.description, MAX_DESC_LEN) ?? "";
+  const categoryId = requireText(input.categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+  const questions = normalizeQuestions(input.questions);
+
+  let created: Quiz | null = null;
+
+  await updateStore((store) => {
+    const categoryExists = store.categories.some(
+      (category) => category.id === categoryId,
+    );
+    if (!categoryExists) {
+      throw new Error("Category not found.");
+    }
+
+    const quiz: Quiz = {
+      id: `quiz-${crypto.randomUUID()}`,
+      title,
+      description,
+      categoryId,
+      createdBy: input.adminId,
+      createdAt: new Date().toISOString(),
+      reviewedBy: input.adminId,
+      reviewedAt: new Date().toISOString(),
+      questions,
+    };
+    created = quiz;
+    store.quizzes.push(quiz);
+  });
+
+  if (!created) {
+    throw new Error("Quiz creation failed.");
+  }
+
+  return created;
+}
+
+export async function deleteQuiz(quizId: string) {
+  const id = requireText(quizId, "Quiz", 64);
+  return updateStore((store) => {
+    const exists = store.quizzes.some((quiz) => quiz.id === id);
+    if (!exists) {
+      throw new Error("Quiz not found.");
+    }
+    store.quizzes = store.quizzes.filter((quiz) => quiz.id !== id);
+  });
+}
+
+export async function deleteUser(input: {
+  userId: string;
+  requesterId: string;
+}) {
+  const userId = requireText(input.userId, "User", 64);
+  const requesterId = requireText(input.requesterId, "Requester", 64);
+
+  return updateStore((store) => {
+    const user = store.users.find((item) => item.id === userId);
+    if (!user) {
+      throw new Error("User not found.");
+    }
+    if (userId === requesterId) {
+      throw new Error("You cannot delete your own account.");
+    }
+    if (user.role === "admin") {
+      const adminCount = store.users.filter(
+        (candidate) => candidate.role === "admin",
+      ).length;
+      if (adminCount <= 1) {
+        throw new Error("Cannot delete the last admin.");
+      }
+    }
+
+    store.users = store.users.filter((item) => item.id !== userId);
+    store.sessions = store.sessions.filter(
+      (session) => session.userId !== userId,
+    );
+    store.pendingQuizzes = store.pendingQuizzes.filter(
+      (quiz) => quiz.submittedBy !== userId,
+    );
+    store.leaderboard = store.leaderboard.filter((entry) => entry.id !== userId);
   });
 }

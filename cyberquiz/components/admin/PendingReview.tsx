@@ -1,6 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import {
+  QuestionEditor,
+  createDraftQuestion,
+  type DraftQuestion,
+} from "@/components/quiz/QuestionEditor";
 
 type Category = {
   id: string;
@@ -23,7 +28,7 @@ type PendingQuiz = {
 };
 
 type PendingDraft = PendingQuiz & {
-  draftQuestions: string;
+  draftQuestions: DraftQuestion[];
   rejectionReasonDraft: string;
 };
 
@@ -55,7 +60,18 @@ export function PendingReview({ categories }: PendingReviewProps) {
       setItems(
         pending.map((quiz) => ({
           ...quiz,
-          draftQuestions: JSON.stringify(quiz.questions, null, 2),
+          draftQuestions:
+            quiz.questions.length > 0
+              ? quiz.questions.map((question) => ({
+                  id: question.id,
+                  prompt: question.prompt,
+                  options: question.options.map((option) => ({
+                    id: option.id,
+                    label: option.label,
+                    isCorrect: option.isCorrect,
+                  })),
+                }))
+              : [createDraftQuestion()],
           rejectionReasonDraft: quiz.rejectionReason ?? "",
         })),
       );
@@ -73,10 +89,13 @@ export function PendingReview({ categories }: PendingReviewProps) {
   async function handleSave(quiz: PendingDraft) {
     setError(null);
     try {
-      const questions = JSON.parse(quiz.draftQuestions);
-      if (!Array.isArray(questions)) {
-        throw new Error("Questions JSON must be an array.");
-      }
+      const questions = quiz.draftQuestions.map((question) => ({
+        prompt: question.prompt,
+        options: question.options.map((option) => ({
+          label: option.label,
+          isCorrect: option.isCorrect,
+        })),
+      }));
       const response = await fetch(`/api/admin/pending/${quiz.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -225,22 +244,23 @@ export function PendingReview({ categories }: PendingReviewProps) {
               </select>
             </label>
 
-            <label className="block text-xs text-white/60">
-              Questions JSON
-              <textarea
+            <div className="space-y-3">
+              <p className="text-xs uppercase tracking-[0.3em] text-white/50">
+                Questions
+              </p>
+              <QuestionEditor
                 value={quiz.draftQuestions}
-                onChange={(event) =>
+                onChange={(nextQuestions) =>
                   setItems((current) =>
                     current.map((item) =>
                       item.id === quiz.id
-                        ? { ...item, draftQuestions: event.target.value }
+                        ? { ...item, draftQuestions: nextQuestions }
                         : item,
                     ),
                   )
                 }
-                className="mt-2 min-h-[220px] w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-mono text-xs text-white outline-none transition focus:border-cyber-cyan/60"
               />
-            </label>
+            </div>
 
             <label className="block text-xs text-white/60">
               Rejection reason

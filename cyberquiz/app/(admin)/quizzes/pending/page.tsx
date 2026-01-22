@@ -1,10 +1,12 @@
 import { GlassPanel } from "@/components/ui/GlassPanel";
 import { PendingReview } from "@/components/admin/PendingReview";
 import { getCategories } from "@/lib/data/store";
+import { requireAdminUser } from "@/lib/auth/requireAdminUser";
 
 export const dynamic = "force-dynamic";
 
 export default async function PendingQuizzesPage() {
+  await requireAdminUser();
   const categories = await getCategories();
 
   return (

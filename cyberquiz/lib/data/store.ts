@@ -1,6 +1,5 @@
-import { promises as fs } from "fs";
-import path from "path";
 import crypto from "crypto";
+import { getSql } from "@/lib/db";
 
 const MAX_TITLE_LEN = 120;
 const MAX_DESC_LEN = 500;
@@ -16,6 +15,7 @@ const MAX_CATEGORY_NAME_LEN = 40;
 const MAX_CATEGORY_DESC_LEN = 160;
 const MAX_REJECTION_LEN = 200;
 const PASSWORD_KEYLEN = 64;
+const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 7;
 
 export type Category = {
   id: string;
@@ -61,9 +61,6 @@ export type User = {
   username: string;
   displayName?: string;
   role: "user" | "admin";
-  salt: string;
-  passwordHash: string;
-  passwordAlgo?: "sha256" | "scrypt";
   createdAt: string;
 };
 
@@ -79,54 +76,54 @@ export type LeaderboardEntry = {
   score: number;
 };
 
-export type Store = {
-  categories: Category[];
-  quizzes: Quiz[];
-  pendingQuizzes: PendingQuiz[];
-  users: User[];
-  sessions: Session[];
-  leaderboard: LeaderboardEntry[];
+type NormalizedQuestion = {
+  prompt: string;
+  options: Array<{ label: string; isCorrect: boolean }>;
 };
 
-const storePath = path.join(process.cwd(), "data", "store.json");
+type QuizRow = {
+  id: string;
+  title: string;
+  description: string;
+  category_id: string;
+  created_by: string;
+  created_at: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  status: "pending" | "approved" | "rejected";
+  rejection_reason: string | null;
+};
 
-async function readStore(): Promise<Store> {
-  try {
-    const raw = await fs.readFile(storePath, "utf8");
-    return JSON.parse(raw) as Store;
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code === "ENOENT") {
-      throw new Error("Storage file missing.");
-    }
-    if (err.code === "EACCES" || err.code === "EPERM") {
-      throw new Error("Storage is not readable.");
-    }
-    throw error;
-  }
-}
+type QuestionRow = {
+  id: string;
+  quiz_id: string;
+  prompt: string;
+  position: number;
+};
 
-async function writeStore(store: Store) {
-  const json = JSON.stringify(store, null, 2);
-  try {
-    await fs.writeFile(storePath, `${json}\n`);
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code === "EACCES" || err.code === "EPERM" || err.code === "EROFS") {
-      throw new Error("Storage is read-only.");
-    }
-    throw error;
-  }
-}
+type OptionRow = {
+  id: string;
+  question_id: string;
+  label: string;
+  is_correct: boolean;
+  position: number;
+};
 
-async function updateStore(
-  mutator: (store: Store) => void,
-): Promise<Store> {
-  const store = await readStore();
-  mutator(store);
-  await writeStore(store);
-  return store;
-}
+type UserRow = {
+  id: string;
+  email: string;
+  username: string;
+  display_name: string | null;
+  role: "user" | "admin";
+  created_at: string;
+  salt: string;
+  password_hash: string;
+  password_algo: string;
+};
+
+type UserSessionRow = UserRow & {
+  expires_at: string;
+};
 
 function requireText(value: string, field: string, maxLen: number) {
   const trimmed = value.trim();
@@ -180,26 +177,16 @@ function slugify(value: string) {
     .replace(/(^-+|-+$)/g, "");
 }
 
-function hashPassword(
-  password: string,
-  salt: string,
-  algo: "sha256" | "scrypt",
-) {
-  if (algo === "sha256") {
-    const hash = crypto.createHash("sha256");
-    hash.update(`${salt}:${password}`);
-    return hash.digest("hex");
-  }
+function hashPassword(password: string, salt: string) {
   const derived = crypto.scryptSync(password, salt, PASSWORD_KEYLEN);
   return derived.toString("hex");
 }
 
-function normalizeQuestions(
-  input: Array<{
-    prompt: string;
-    options: Array<{ label: string; isCorrect: boolean }>;
-  }>,
-) {
+function hashSessionToken(token: string) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function normalizeQuestions(input: NormalizedQuestion[]) {
   if (!Array.isArray(input) || input.length === 0) {
     throw new Error("Questions are required.");
   }
@@ -208,7 +195,11 @@ function normalizeQuestions(
   }
 
   return input.map((question) => {
-    const prompt = requireText(question.prompt ?? "", "Question prompt", MAX_PROMPT_LEN);
+    const prompt = requireText(
+      question.prompt ?? "",
+      "Question prompt",
+      MAX_PROMPT_LEN,
+    );
     if (!Array.isArray(question.options) || question.options.length < 2) {
       throw new Error("Each question needs at least two options.");
     }
@@ -217,7 +208,6 @@ function normalizeQuestions(
     }
 
     const options = question.options.map((option) => ({
-      id: `opt-${crypto.randomUUID()}`,
       label: requireText(option.label ?? "", "Option label", MAX_OPTION_LEN),
       isCorrect: Boolean(option.isCorrect),
     }));
@@ -227,41 +217,209 @@ function normalizeQuestions(
     }
 
     return {
-      id: `q-${crypto.randomUUID()}`,
       prompt,
       options,
     };
   });
 }
 
-export async function getCategories() {
-  const store = await readStore();
-  return store.categories;
+function mapUserRow(row: UserRow | UserSessionRow): User {
+  return {
+    id: row.id,
+    email: row.email,
+    username: row.username,
+    displayName: row.display_name ?? undefined,
+    role: row.role,
+    createdAt: row.created_at,
+  };
 }
 
-export async function getCategoryById(categoryId: string) {
-  const store = await readStore();
-  return store.categories.find((category) => category.id === categoryId);
+type SqlClient = ReturnType<typeof getSql>;
+
+async function withTransaction<T>(fn: (tx: SqlClient) => Promise<T>) {
+  const sql = getSql() as SqlClient & {
+    transaction?: (handler: (tx: SqlClient) => Promise<T>) => Promise<T>;
+    begin?: (handler: (tx: SqlClient) => Promise<T>) => Promise<T>;
+  };
+
+  if (typeof sql.transaction === "function") {
+    return sql.transaction(fn);
+  }
+  if (typeof sql.begin === "function") {
+    return sql.begin(fn);
+  }
+  return fn(sql);
+}
+
+async function loadQuestionsByQuizIds(quizIds: string[]) {
+  const sql = getSql();
+  if (quizIds.length === 0) {
+    return new Map<string, Question[]>();
+  }
+
+  const questionRows = (await sql`
+    select id, quiz_id, prompt, position
+    from questions
+    where quiz_id::text = any(${quizIds})
+    order by quiz_id, position
+  `) as QuestionRow[];
+
+  const questionIds = questionRows.map((row) => row.id);
+  const optionRows = questionIds.length
+    ? ((await sql`
+        select id, question_id, label, is_correct, position
+        from options
+        where question_id::text = any(${questionIds})
+        order by question_id, position
+      `) as OptionRow[])
+    : [];
+
+  const optionsByQuestion = new Map<string, Option[]>();
+  for (const option of optionRows) {
+    const list = optionsByQuestion.get(option.question_id) ?? [];
+    list.push({
+      id: option.id,
+      label: option.label,
+      isCorrect: option.is_correct,
+    });
+    optionsByQuestion.set(option.question_id, list);
+  }
+
+  const questionsByQuiz = new Map<string, Question[]>();
+  for (const question of questionRows) {
+    const list = questionsByQuiz.get(question.quiz_id) ?? [];
+    list.push({
+      id: question.id,
+      prompt: question.prompt,
+      options: optionsByQuestion.get(question.id) ?? [],
+    });
+    questionsByQuiz.set(question.quiz_id, list);
+  }
+
+  return questionsByQuiz;
+}
+
+async function hydrateQuizzes(rows: QuizRow[]): Promise<Quiz[]> {
+  const questionsByQuiz = await loadQuestionsByQuizIds(
+    rows.map((row) => row.id),
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    categoryId: row.category_id,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    reviewedBy: row.reviewed_by ?? undefined,
+    reviewedAt: row.reviewed_at ?? undefined,
+    questions: questionsByQuiz.get(row.id) ?? [],
+  }));
+}
+
+async function hydratePendingQuizzes(rows: QuizRow[]): Promise<PendingQuiz[]> {
+  const questionsByQuiz = await loadQuestionsByQuizIds(
+    rows.map((row) => row.id),
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    categoryId: row.category_id,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    reviewedBy: row.reviewed_by ?? undefined,
+    reviewedAt: row.reviewed_at ?? undefined,
+    questions: questionsByQuiz.get(row.id) ?? [],
+    status: row.status === "rejected" ? "rejected" : "pending",
+    submittedBy: row.created_by,
+    submittedAt: row.created_at,
+    rejectionReason: row.rejection_reason ?? undefined,
+  }));
+}
+
+export async function getCategories(): Promise<Category[]> {
+  const sql = getSql();
+  const rows = (await sql`
+    select id, name, slug, description
+    from categories
+    order by name
+  `) as Category[];
+  return rows;
+}
+
+export async function getCategoryById(
+  categoryId: string,
+): Promise<Category | undefined> {
+  const sql = getSql();
+  const rows = (await sql`
+    select id, name, slug, description
+    from categories
+    where id = ${categoryId}
+    limit 1
+  `) as Category[];
+  return rows[0];
 }
 
 export async function getQuizzes(): Promise<Quiz[]> {
-  const store = await readStore();
-  return store.quizzes;
+  const sql = getSql();
+  const rows = (await sql`
+    select id, title, description, category_id, created_by, created_at,
+           reviewed_by, reviewed_at, status, rejection_reason
+    from quizzes
+    where status = 'approved'
+    order by created_at desc
+  `) as QuizRow[];
+
+  return hydrateQuizzes(rows);
 }
 
-export async function getQuizById(quizId: string) {
-  const store = await readStore();
-  return store.quizzes.find((quiz) => quiz.id === quizId);
+export async function getQuizById(quizId: string): Promise<Quiz | undefined> {
+  const sql = getSql();
+  const rows = (await sql`
+    select id, title, description, category_id, created_by, created_at,
+           reviewed_by, reviewed_at, status, rejection_reason
+    from quizzes
+    where id = ${quizId} and status = 'approved'
+    limit 1
+  `) as QuizRow[];
+
+  if (rows.length === 0) {
+    return undefined;
+  }
+
+  const [quiz] = await hydrateQuizzes(rows);
+  return quiz;
 }
 
-export async function getLeaderboard() {
-  const store = await readStore();
-  return store.leaderboard;
+export async function getLeaderboard(): Promise<LeaderboardEntry[]> {
+  const sql = getSql();
+  const rows = (await sql`
+    select u.id, u.username, l.score
+    from leaderboard_entries l
+    join users u on u.id = l.user_id
+    order by l.score desc
+    limit 25
+  `) as LeaderboardEntry[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    username: row.username,
+    score: Number(row.score),
+  }));
 }
 
-export async function getUsers() {
-  const store = await readStore();
-  return store.users;
+export async function getUsers(): Promise<User[]> {
+  const sql = getSql();
+  const rows = (await sql`
+    select id, email, username, display_name, role, created_at,
+           salt, password_hash, password_algo
+    from users
+    order by created_at desc
+  `) as UserRow[];
+
+  return rows.map((row) => mapUserRow(row));
 }
 
 type CreateUserInput = {
@@ -275,7 +433,7 @@ type CreateUserInternalInput = CreateUserInput & {
   role: "user" | "admin";
 };
 
-async function createUserInternal(input: CreateUserInternalInput) {
+async function createUserInternal(input: CreateUserInternalInput): Promise<User> {
   const email = requireText(input.email, "Email", MAX_EMAIL_LEN).toLowerCase();
   validateEmail(email);
   const username = requireText(input.username, "Username", MAX_USERNAME_LEN);
@@ -287,77 +445,73 @@ async function createUserInternal(input: CreateUserInternalInput) {
   const displayName =
     optionalText(input.displayName, MAX_USERNAME_LEN) ?? username;
 
-  let createdUser: User | null = null;
+  const salt = crypto.randomBytes(16).toString("hex");
+  const passwordHash = hashPassword(password, salt);
 
-  await updateStore((store) => {
-    const emailExists = store.users.some((user) => user.email === email);
-    const usernameExists = store.users.some(
-      (user) => user.username.toLowerCase() === username.toLowerCase(),
-    );
-    if (emailExists || usernameExists) {
-      throw new Error("User already exists.");
+  const sql = getSql();
+  try {
+    const rows = (await sql`
+      insert into users (email, username, display_name, role, salt, password_hash, password_algo)
+      values (${email}, ${username}, ${displayName}, ${input.role}, ${salt}, ${passwordHash}, 'scrypt')
+      returning id, email, username, display_name, role, created_at, salt, password_hash, password_algo
+    `) as UserRow[];
+
+    if (!rows[0]) {
+      throw new Error("User creation failed.");
     }
 
-    const salt = crypto.randomBytes(16).toString("hex");
-    const passwordHash = hashPassword(password, salt, "scrypt");
-    const user: User = {
-      id: `user-${crypto.randomUUID()}`,
-      email,
-      username,
-      displayName,
-      role: input.role,
-      salt,
-      passwordHash,
-      passwordAlgo: "scrypt",
-      createdAt: new Date().toISOString(),
-    };
-    createdUser = user;
-    store.users.push(user);
-  });
-
-  if (!createdUser) {
-    const store = await readStore();
-    createdUser = store.users.find((user) => user.email === email) ?? null;
+    return mapUserRow(rows[0]);
+  } catch (error) {
+    const err = error as { code?: string };
+    if (err.code === "23505") {
+      throw new Error("User already exists.");
+    }
+    throw error;
   }
-
-  if (!createdUser) {
-    throw new Error("User creation failed.");
-  }
-
-  return createdUser;
 }
 
-export async function createUser(input: CreateUserInput) {
+export async function createUser(input: CreateUserInput): Promise<User> {
   return createUserInternal({ ...input, role: "user" });
 }
 
 export async function createUserAsAdmin(
   input: CreateUserInput & { role?: "user" | "admin" },
-) {
+): Promise<User> {
   return createUserInternal({ ...input, role: input.role ?? "user" });
 }
 
 export async function verifyUser(input: {
   identifier: string;
   password: string;
-}) {
+}): Promise<User> {
   const identifier = input.identifier.trim().toLowerCase();
   const password = input.password.trim();
-  const store = await readStore();
 
-  const user = store.users.find(
-    (candidate) =>
-      candidate.email === identifier ||
-      candidate.username.toLowerCase() === identifier,
-  );
+  if (!identifier || !password) {
+    throw new Error("Invalid credentials.");
+  }
 
+  const sql = getSql();
+  const rows = (await sql`
+    select id, email, username, display_name, role, created_at,
+           salt, password_hash, password_algo
+    from users
+    where lower(email) = ${identifier} or lower(username) = ${identifier}
+    limit 1
+  `) as UserRow[];
+
+  const user = rows[0];
   if (!user) {
     throw new Error("Invalid credentials.");
   }
 
-  const algo = user.passwordAlgo ?? "sha256";
-  const passwordHash = hashPassword(password, user.salt, algo);
-  const expected = Buffer.from(user.passwordHash, "hex");
+  const algo = user.password_algo ?? "scrypt";
+  if (algo !== "scrypt") {
+    throw new Error("Invalid credentials.");
+  }
+
+  const passwordHash = hashPassword(password, user.salt);
+  const expected = Buffer.from(user.password_hash, "hex");
   const actual = Buffer.from(passwordHash, "hex");
   if (expected.length !== actual.length) {
     throw new Error("Invalid credentials.");
@@ -366,47 +520,65 @@ export async function verifyUser(input: {
     throw new Error("Invalid credentials.");
   }
 
-  return user;
+  return mapUserRow(user);
 }
 
-export async function createSession(userId: string) {
+export async function createSession(
+  userId: string,
+): Promise<{ token: string; expiresAt: number }> {
   const token = crypto.randomUUID();
-  const expiresAt = Date.now() + 1000 * 60 * 60 * 24 * 7;
+  const tokenHash = hashSessionToken(token);
+  const expiresAt = new Date(Date.now() + SESSION_MAX_AGE_MS);
 
-  await updateStore((store) => {
-    store.sessions = store.sessions.filter(
-      (session) => session.userId !== userId,
-    );
-    store.sessions.push({ token, userId, expiresAt });
-  });
+  const sql = getSql();
+  await sql`
+    delete from sessions where user_id = ${userId}
+  `;
 
-  return { token, expiresAt };
+  await sql`
+    insert into sessions (token_hash, user_id, expires_at)
+    values (${tokenHash}, ${userId}, ${expiresAt.toISOString()})
+  `;
+
+  return { token, expiresAt: expiresAt.getTime() };
 }
 
 export async function removeSession(token: string) {
-  await updateStore((store) => {
-    store.sessions = store.sessions.filter((session) => session.token !== token);
-  });
+  const tokenHash = hashSessionToken(token);
+  const sql = getSql();
+  await sql`
+    delete from sessions where token_hash = ${tokenHash}
+  `;
 }
 
-export async function getUserBySession(token?: string) {
+export async function getUserBySession(token?: string): Promise<User | null> {
   if (!token) {
     return null;
   }
 
-  const store = await readStore();
-  const session = store.sessions.find((item) => item.token === token);
-  if (!session) {
+  const tokenHash = hashSessionToken(token);
+  const sql = getSql();
+  const rows = (await sql`
+    select u.id, u.email, u.username, u.display_name, u.role, u.created_at,
+           u.salt, u.password_hash, u.password_algo, s.expires_at
+    from sessions s
+    join users u on u.id = s.user_id
+    where s.token_hash = ${tokenHash}
+    limit 1
+  `) as UserSessionRow[];
+
+  const row = rows[0];
+  if (!row) {
     return null;
   }
 
-  if (session.expiresAt < Date.now()) {
+  const expiresAt = Date.parse(row.expires_at);
+  if (Number.isNaN(expiresAt) || expiresAt < Date.now()) {
     await removeSession(token);
     return null;
   }
 
-  const user = store.users.find((candidate) => candidate.id === session.userId);
-  return user ?? null;
+  return mapUserRow(row);
 }
 
 export async function submitQuiz(input: {
@@ -418,47 +590,84 @@ export async function submitQuiz(input: {
     options: Array<{ label: string; isCorrect: boolean }>;
   }>;
   userId: string;
-}) {
+}): Promise<void> {
   const title = requireText(input.title, "Title", MAX_TITLE_LEN);
   const description = optionalText(input.description, MAX_DESC_LEN) ?? "";
-  const categoryId = requireText(input.categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+  const categoryId = requireText(
+    input.categoryId,
+    "Category",
+    MAX_CATEGORY_NAME_LEN,
+  );
   const questions = normalizeQuestions(input.questions);
 
-  await updateStore((store) => {
-    const categoryExists = store.categories.some(
-      (category) => category.id === categoryId,
-    );
-    if (!categoryExists) {
-      throw new Error("Category not found.");
+  const sql = getSql();
+  const categoryExists = (await sql`
+    select id from categories where id = ${categoryId} limit 1
+  `) as Array<{ id: string }>;
+  if (categoryExists.length === 0) {
+    throw new Error("Category not found.");
+  }
+
+  await withTransaction(async (tx) => {
+    const quizRows = (await tx`
+      insert into quizzes (title, description, category_id, created_by, status)
+      values (${title}, ${description}, ${categoryId}, ${input.userId}, 'pending')
+      returning id
+    `) as Array<{ id: string }>;
+
+    const quizId = quizRows[0]?.id;
+    if (!quizId) {
+      throw new Error("Quiz creation failed.");
     }
 
-    const pendingQuiz: PendingQuiz = {
-      id: `pending-${crypto.randomUUID()}`,
-      title,
-      description,
-      categoryId,
-      createdBy: input.userId,
-      createdAt: new Date().toISOString(),
-      submittedBy: input.userId,
-      submittedAt: new Date().toISOString(),
-      status: "pending",
-      questions,
-    };
+    for (const [questionIndex, question] of questions.entries()) {
+      const questionRows = (await tx`
+        insert into questions (quiz_id, prompt, position)
+        values (${quizId}, ${question.prompt}, ${questionIndex})
+        returning id
+      `) as Array<{ id: string }>;
 
-    store.pendingQuizzes.push(pendingQuiz);
+      const questionId = questionRows[0]?.id;
+      if (!questionId) {
+        throw new Error("Question creation failed.");
+      }
+
+      for (const [optionIndex, option] of question.options.entries()) {
+        await tx`
+          insert into options (question_id, label, is_correct, position)
+          values (${questionId}, ${option.label}, ${option.isCorrect}, ${optionIndex})
+        `;
+      }
+    }
   });
 }
 
-export async function getUserSubmissions(userId: string) {
-  const store = await readStore();
-  return store.pendingQuizzes.filter(
-    (quiz) => quiz.submittedBy === userId,
-  );
+export async function getUserSubmissions(
+  userId: string,
+): Promise<PendingQuiz[]> {
+  const sql = getSql();
+  const rows = (await sql`
+    select id, title, description, category_id, created_by, created_at,
+           reviewed_by, reviewed_at, status, rejection_reason
+    from quizzes
+    where created_by = ${userId} and status in ('pending', 'rejected')
+    order by created_at desc
+  `) as QuizRow[];
+
+  return hydratePendingQuizzes(rows);
 }
 
-export async function getPendingQuizzes() {
-  const store = await readStore();
-  return store.pendingQuizzes.filter((quiz) => quiz.status === "pending");
+export async function getPendingQuizzes(): Promise<PendingQuiz[]> {
+  const sql = getSql();
+  const rows = (await sql`
+    select id, title, description, category_id, created_by, created_at,
+           reviewed_by, reviewed_at, status, rejection_reason
+    from quizzes
+    where status = 'pending'
+    order by created_at desc
+  `) as QuizRow[];
+
+  return hydratePendingQuizzes(rows);
 }
 
 export async function updatePendingQuiz(input: {
@@ -470,83 +679,118 @@ export async function updatePendingQuiz(input: {
     prompt: string;
     options: Array<{ label: string; isCorrect: boolean }>;
   }>;
-}) {
+}): Promise<void> {
   const title = requireText(input.title, "Title", MAX_TITLE_LEN);
   const description = optionalText(input.description, MAX_DESC_LEN) ?? "";
-  const categoryId = requireText(input.categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+  const categoryId = requireText(
+    input.categoryId,
+    "Category",
+    MAX_CATEGORY_NAME_LEN,
+  );
   const questions = normalizeQuestions(input.questions);
 
-  return updateStore((store) => {
-    const quiz = store.pendingQuizzes.find((item) => item.id === input.quizId);
-    if (!quiz) {
+  const sql = getSql();
+  const categoryExists = (await sql`
+    select id from categories where id = ${categoryId} limit 1
+  `) as Array<{ id: string }>;
+  if (categoryExists.length === 0) {
+    throw new Error("Category not found.");
+  }
+
+  await withTransaction(async (tx) => {
+    const updated = (await tx`
+      update quizzes
+      set title = ${title},
+          description = ${description},
+          category_id = ${categoryId},
+          updated_at = now()
+      where id = ${input.quizId} and status = 'pending'
+      returning id
+    `) as Array<{ id: string }>;
+
+    if (updated.length === 0) {
       throw new Error("Pending quiz not found.");
     }
 
-    const categoryExists = store.categories.some(
-      (category) => category.id === categoryId,
-    );
-    if (!categoryExists) {
-      throw new Error("Category not found.");
-    }
+    await tx`
+      delete from questions where quiz_id = ${input.quizId}
+    `;
 
-    quiz.title = title;
-    quiz.description = description;
-    quiz.categoryId = categoryId;
-    quiz.questions = questions;
+    for (const [questionIndex, question] of questions.entries()) {
+      const questionRows = (await tx`
+        insert into questions (quiz_id, prompt, position)
+        values (${input.quizId}, ${question.prompt}, ${questionIndex})
+        returning id
+      `) as Array<{ id: string }>;
+
+      const questionId = questionRows[0]?.id;
+      if (!questionId) {
+        throw new Error("Question creation failed.");
+      }
+
+      for (const [optionIndex, option] of question.options.entries()) {
+        await tx`
+          insert into options (question_id, label, is_correct, position)
+          values (${questionId}, ${option.label}, ${option.isCorrect}, ${optionIndex})
+        `;
+      }
+    }
   });
 }
 
 export async function approvePendingQuiz(input: {
   quizId: string;
   adminId: string;
-}) {
-  return updateStore((store) => {
-    const index = store.pendingQuizzes.findIndex(
-      (quiz) => quiz.id === input.quizId,
-    );
-    if (index === -1) {
-      throw new Error("Pending quiz not found.");
-    }
+}): Promise<void> {
+  const sql = getSql();
+  const rows = (await sql`
+    update quizzes
+    set status = 'approved',
+        reviewed_by = ${input.adminId},
+        reviewed_at = now(),
+        rejection_reason = null,
+        updated_at = now()
+    where id = ${input.quizId} and status = 'pending'
+    returning id
+  `) as Array<{ id: string }>;
 
-    const [quiz] = store.pendingQuizzes.splice(index, 1);
-    const { status, submittedAt, submittedBy, rejectionReason, ...baseQuiz } =
-      quiz;
-    const approvedQuiz: Quiz = {
-      ...baseQuiz,
-      reviewedBy: input.adminId,
-      reviewedAt: new Date().toISOString(),
-    };
-
-    store.quizzes.push(approvedQuiz);
-  });
+  if (rows.length === 0) {
+    throw new Error("Pending quiz not found.");
+  }
 }
 
 export async function rejectPendingQuiz(input: {
   quizId: string;
   adminId: string;
   rejectionReason: string;
-}) {
-  return updateStore((store) => {
-    const quiz = store.pendingQuizzes.find((item) => item.id === input.quizId);
-    if (!quiz) {
-      throw new Error("Pending quiz not found.");
-    }
+}): Promise<void> {
+  const rejectionReason = requireText(
+    input.rejectionReason ?? "",
+    "Rejection reason",
+    MAX_REJECTION_LEN,
+  );
 
-    quiz.status = "rejected";
-    quiz.rejectionReason = requireText(
-      input.rejectionReason ?? "",
-      "Rejection reason",
-      MAX_REJECTION_LEN,
-    );
-    quiz.reviewedBy = input.adminId;
-    quiz.reviewedAt = new Date().toISOString();
-  });
+  const sql = getSql();
+  const rows = (await sql`
+    update quizzes
+    set status = 'rejected',
+        reviewed_by = ${input.adminId},
+        reviewed_at = now(),
+        rejection_reason = ${rejectionReason},
+        updated_at = now()
+    where id = ${input.quizId} and status = 'pending'
+    returning id
+  `) as Array<{ id: string }>;
+
+  if (rows.length === 0) {
+    throw new Error("Pending quiz not found.");
+  }
 }
 
 export async function createCategory(input: {
   name: string;
   description?: string;
-}) {
+}): Promise<Category> {
   const name = requireText(input.name, "Category name", MAX_CATEGORY_NAME_LEN);
   const description =
     optionalText(input.description, MAX_CATEGORY_DESC_LEN) ?? "";
@@ -555,53 +799,47 @@ export async function createCategory(input: {
     throw new Error("Category name is invalid.");
   }
 
-  let created: Category | null = null;
+  const sql = getSql();
+  try {
+    const rows = (await sql`
+      insert into categories (id, name, slug, description)
+      values (${slug}, ${name}, ${slug}, ${description})
+      returning id, name, slug, description
+    `) as Category[];
 
-  await updateStore((store) => {
-    const exists = store.categories.some(
-      (category) => category.id === slug || category.slug === slug,
-    );
-    if (exists) {
+    if (!rows[0]) {
+      throw new Error("Category creation failed.");
+    }
+
+    return rows[0];
+  } catch (error) {
+    const err = error as { code?: string };
+    if (err.code === "23505") {
       throw new Error("Category already exists.");
     }
-
-    const category: Category = {
-      id: slug,
-      name,
-      slug,
-      description,
-    };
-    created = category;
-    store.categories.push(category);
-  });
-
-  if (!created) {
-    throw new Error("Category creation failed.");
+    throw error;
   }
-
-  return created;
 }
 
-export async function deleteCategory(categoryId: string) {
+export async function deleteCategory(categoryId: string): Promise<void> {
   const id = requireText(categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+  const sql = getSql();
 
-  return updateStore((store) => {
-    const category = store.categories.find((item) => item.id === id);
-    if (!category) {
-      throw new Error("Category not found.");
-    }
-    const usedInQuizzes = store.quizzes.some(
-      (quiz) => quiz.categoryId === id,
-    );
-    const usedInPending = store.pendingQuizzes.some(
-      (quiz) => quiz.categoryId === id,
-    );
-    if (usedInQuizzes || usedInPending) {
-      throw new Error("Category is in use.");
-    }
+  const used = (await sql`
+    select id from quizzes where category_id = ${id} limit 1
+  `) as Array<{ id: string }>;
 
-    store.categories = store.categories.filter((item) => item.id !== id);
-  });
+  if (used.length > 0) {
+    throw new Error("Category is in use.");
+  }
+
+  const rows = (await sql`
+    delete from categories where id = ${id} returning id
+  `) as Array<{ id: string }>;
+
+  if (rows.length === 0) {
+    throw new Error("Category not found.");
+  }
 }
 
 export async function createQuizAsAdmin(input: {
@@ -616,83 +854,125 @@ export async function createQuizAsAdmin(input: {
 }): Promise<Quiz> {
   const title = requireText(input.title, "Title", MAX_TITLE_LEN);
   const description = optionalText(input.description, MAX_DESC_LEN) ?? "";
-  const categoryId = requireText(input.categoryId, "Category", MAX_CATEGORY_NAME_LEN);
+  const categoryId = requireText(
+    input.categoryId,
+    "Category",
+    MAX_CATEGORY_NAME_LEN,
+  );
   const questions = normalizeQuestions(input.questions);
 
-  let created: Quiz | null = null;
-
-  await updateStore((store) => {
-    const categoryExists = store.categories.some(
-      (category) => category.id === categoryId,
-    );
-    if (!categoryExists) {
-      throw new Error("Category not found.");
-    }
-
-    const quiz: Quiz = {
-      id: `quiz-${crypto.randomUUID()}`,
-      title,
-      description,
-      categoryId,
-      createdBy: input.adminId,
-      createdAt: new Date().toISOString(),
-      reviewedBy: input.adminId,
-      reviewedAt: new Date().toISOString(),
-      questions,
-    };
-    created = quiz;
-    store.quizzes.push(quiz);
-  });
-
-  if (!created) {
-    throw new Error("Quiz creation failed.");
+  const sql = getSql();
+  const categoryExists = (await sql`
+    select id from categories where id = ${categoryId} limit 1
+  `) as Array<{ id: string }>;
+  if (categoryExists.length === 0) {
+    throw new Error("Category not found.");
   }
 
-  return created;
+  let quizId = "";
+
+  await withTransaction(async (tx) => {
+    const quizRows = (await tx`
+      insert into quizzes (
+        title, description, category_id, created_by,
+        status, reviewed_by, reviewed_at
+      )
+      values (
+        ${title}, ${description}, ${categoryId}, ${input.adminId},
+        'approved', ${input.adminId}, now()
+      )
+      returning id
+    `) as Array<{ id: string }>;
+
+    quizId = quizRows[0]?.id ?? "";
+    if (!quizId) {
+      throw new Error("Quiz creation failed.");
+    }
+
+    for (const [questionIndex, question] of questions.entries()) {
+      const questionRows = (await tx`
+        insert into questions (quiz_id, prompt, position)
+        values (${quizId}, ${question.prompt}, ${questionIndex})
+        returning id
+      `) as Array<{ id: string }>;
+
+      const questionId = questionRows[0]?.id;
+      if (!questionId) {
+        throw new Error("Question creation failed.");
+      }
+
+      for (const [optionIndex, option] of question.options.entries()) {
+        await tx`
+          insert into options (question_id, label, is_correct, position)
+          values (${questionId}, ${option.label}, ${option.isCorrect}, ${optionIndex})
+        `;
+      }
+    }
+  });
+
+  const quiz = await getQuizById(quizId);
+  if (!quiz) {
+    throw new Error("Quiz creation failed.");
+  }
+  return quiz;
 }
 
-export async function deleteQuiz(quizId: string) {
+export async function deleteQuiz(quizId: string): Promise<void> {
   const id = requireText(quizId, "Quiz", 64);
-  return updateStore((store) => {
-    const exists = store.quizzes.some((quiz) => quiz.id === id);
-    if (!exists) {
-      throw new Error("Quiz not found.");
-    }
-    store.quizzes = store.quizzes.filter((quiz) => quiz.id !== id);
-  });
+  const sql = getSql();
+  const rows = (await sql`
+    delete from quizzes where id = ${id} returning id
+  `) as Array<{ id: string }>;
+
+  if (rows.length === 0) {
+    throw new Error("Quiz not found.");
+  }
 }
 
 export async function deleteUser(input: {
   userId: string;
   requesterId: string;
-}) {
+}): Promise<void> {
   const userId = requireText(input.userId, "User", 64);
   const requesterId = requireText(input.requesterId, "Requester", 64);
 
-  return updateStore((store) => {
-    const user = store.users.find((item) => item.id === userId);
-    if (!user) {
-      throw new Error("User not found.");
-    }
-    if (userId === requesterId) {
-      throw new Error("You cannot delete your own account.");
-    }
-    if (user.role === "admin") {
-      const adminCount = store.users.filter(
-        (candidate) => candidate.role === "admin",
-      ).length;
-      if (adminCount <= 1) {
-        throw new Error("Cannot delete the last admin.");
-      }
-    }
+  if (userId === requesterId) {
+    throw new Error("You cannot delete your own account.");
+  }
 
-    store.users = store.users.filter((item) => item.id !== userId);
-    store.sessions = store.sessions.filter(
-      (session) => session.userId !== userId,
-    );
-    store.pendingQuizzes = store.pendingQuizzes.filter(
-      (quiz) => quiz.submittedBy !== userId,
-    );
-    store.leaderboard = store.leaderboard.filter((entry) => entry.id !== userId);
-  });
+  const sql = getSql();
+  const users = (await sql`
+    select id, role, email, username, display_name, created_at,
+           salt, password_hash, password_algo
+    from users
+    where id = ${userId}
+    limit 1
+  `) as UserRow[];
+
+  const user = users[0];
+  if (!user) {
+    throw new Error("User not found.");
+  }
+
+  if (user.role === "admin") {
+    const admins = (await sql`
+      select count(*) as count from users where role = 'admin'
+    `) as Array<{ count: string }>;
+    const adminCount = Number(admins[0]?.count ?? 0);
+    if (adminCount <= 1) {
+      throw new Error("Cannot delete the last admin.");
+    }
+  }
+
+  const quizCountRows = (await sql`
+    select count(*) as count from quizzes where created_by = ${userId}
+  `) as Array<{ count: string }>;
+  const quizCount = Number(quizCountRows[0]?.count ?? 0);
+  if (quizCount > 0) {
+    throw new Error("Delete this user's quizzes first.");
+  }
+
+  await sql`
+    delete from users where id = ${userId}
+  `;
 }
